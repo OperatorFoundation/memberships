@@ -1,0 +1,15 @@
+[Unit]
+Description=Memberships PayPal Webhook Handler
+After=network.target
+
+[Service]
+Type=simple
+User=memberships
+WorkingDirectory=/home/memberships/memberships
+ExecStart=/home/memberships/go/bin/memberships
+Restart=always
+RestartSec=5
+Environment="PATH=/usr/bin:/bin"
+
+[Install]
+WantedBy=multi-user.target
