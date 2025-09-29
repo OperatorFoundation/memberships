@@ -1,7 +1,6 @@
 package main
 
 import (
-    "bytes"
     "database/sql"
     "encoding/json"
     "fmt"
@@ -16,59 +15,25 @@ import (
     _ "github.com/lib/pq"
 )
 
-// PayPal webhook event structures
-type WebhookEvent struct {
-    ID         string    `json:"id"`
-    EventType  string    `json:"event_type"`
-    CreateTime time.Time `json:"create_time"`
-    Resource   Resource  `json:"resource"`
-}
-
-type Resource struct {
-    ID                 string     `json:"id"`
-    Status             string     `json:"status"`
-    CustomID           string     `json:"custom_id"`
-    Subscriber         Subscriber `json:"subscriber"`
-    BillingAgreementID string     `json:"billing_agreement_id"`
-    Amount             Amount     `json:"amount"`
-    Payer              Payer      `json:"payer"`
-}
-
-type Subscriber struct {
-    EmailAddress string `json:"email_address"`
-    PayerID      string `json:"payer_id"`
-    Name         Name   `json:"name"`
-}
-
-type Payer struct {
-    PayerID      string       `json:"payer_id"`
-    EmailAddress string       `json:"email_address"`
-    PayerInfo    PayerInfo    `json:"payer_info"`
-}
-
-type PayerInfo struct {
-    Email   string `json:"email"`
-    PayerID string `json:"payer_id"`
-}
-
-type Name struct {
-    GivenName string `json:"given_name"`
-    Surname   string `json:"surname"`
-}
-
-type Amount struct {
-    Value        string `json:"value"`
-    CurrencyCode string `json:"currency_code"`
-}
-
 // Configuration
 type Config struct {
-    PayPalClientID     string
-    PayPalClientSecret string
-    PayPalWebhookID    string
-    PayPalBaseURL      string
-    DatabaseURL        string
-    Port               string
+    DatabaseURL    string
+    Port           string
+    WebhookSecret  string // Shared secret with Zapier for authentication
+}
+
+// Webhook payload from Zapier/GiveLively
+type MemberWebhook struct {
+    Email        string  `json:"email"`
+    Name         string  `json:"name"`
+    Amount       float64 `json:"amount"`
+    Frequency    string  `json:"frequency"`
+    Status       string  `json:"status"`        // active, cancelled, failed
+    DonationID   string  `json:"donation_id"`   // GiveLively's donation/subscription ID
+    DonationDate string  `json:"donation_date"`
+    EventType    string  `json:"event_type"`    // new_subscription, cancelled, payment, etc.
+    Campaign     string  `json:"campaign,omitempty"`
+    Phone        string  `json:"phone,omitempty"`
 }
 
 // Database wrapper
@@ -76,13 +41,15 @@ type Database struct {
     *sql.DB
 }
 
-var config Config
-var logger *log.Logger
-var db *Database
+var (
+    config Config
+    logger *log.Logger
+    db     *Database
+)
 
 func init() {
     // Set up logger
-    logger = log.New(os.Stdout, "[WEBHOOK] ", log.LstdFlags|log.Lshortfile)
+    logger = log.New(os.Stdout, "[MEMBERSHIP] ", log.LstdFlags|log.Lshortfile)
     
     // Load .env file if it exists
     if err := godotenv.Load(); err != nil {
@@ -91,16 +58,18 @@ func init() {
     
     // Load configuration
     config = Config{
-        PayPalClientID:     os.Getenv("PAYPAL_CLIENT_ID"),
-        PayPalClientSecret: os.Getenv("PAYPAL_CLIENT_SECRET"),
-        PayPalWebhookID:    os.Getenv("PAYPAL_WEBHOOK_ID"),
-        PayPalBaseURL:      getEnvOrDefault("PAYPAL_BASE_URL", "https://api.paypal.com"),
-        DatabaseURL:        os.Getenv("DATABASE_URL"),
-        Port:               getEnvOrDefault("PORT", "3000"),
+        DatabaseURL:   os.Getenv("DATABASE_URL"),
+        Port:          getEnvOrDefault("PORT", "3000"),
+        WebhookSecret: os.Getenv("WEBHOOK_SECRET"),
     }
     
+    // Validate required config
     if config.DatabaseURL == "" {
         logger.Fatal("DATABASE_URL environment variable is required")
+    }
+    
+    if config.WebhookSecret == "" {
+        logger.Fatal("WEBHOOK_SECRET environment variable is required")
     }
 }
 
@@ -119,7 +88,7 @@ func NewDatabase(connStr string) (*Database, error) {
     }
     
     // Configure connection pool
-    conn.SetMaxOpenConns(25)
+    conn.SetMaxOpenConns(10)
     conn.SetMaxIdleConns(5)
     conn.SetConnMaxLifetime(5 * time.Minute)
     
@@ -128,55 +97,58 @@ func NewDatabase(connStr string) (*Database, error) {
         return nil, fmt.Errorf("failed to ping database: %w", err)
     }
     
+    logger.Println("Database connected successfully")
     return &Database{conn}, nil
 }
 
 // Create tables if they don't exist
 func (db *Database) createTables() error {
     schema := `
-    -- Members table
+    -- Members table (simplified - no PayPal specific fields)
     CREATE TABLE IF NOT EXISTS members (
         id SERIAL PRIMARY KEY,
-        paypal_email VARCHAR(255) UNIQUE NOT NULL,
-        paypal_payer_id VARCHAR(50) UNIQUE,
-        current_subscription_id VARCHAR(50) UNIQUE,
-        subscription_status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        email VARCHAR(255) UNIQUE NOT NULL,
+        name VARCHAR(255),
+        subscription_id VARCHAR(100) UNIQUE,  -- GiveLively donation ID
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
         monthly_amount DECIMAL(10, 2),
-        referred_by VARCHAR(255),
-        given_name VARCHAR(100),
-        surname VARCHAR(100),
+        frequency VARCHAR(20) DEFAULT 'monthly',
+        campaign VARCHAR(255),
+        phone VARCHAR(50),
+        joined_date DATE,
+        cancelled_date DATE,
+        last_payment_date DATE,
+        total_donated DECIMAL(10, 2) DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
-    -- Subscription history table
-    CREATE TABLE IF NOT EXISTS subscription_history (
-        id SERIAL PRIMARY KEY,
-        member_id INTEGER REFERENCES members(id),
-        subscription_id VARCHAR(50) NOT NULL,
-        status VARCHAR(20),
-        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        ended_at TIMESTAMP,
-        UNIQUE(subscription_id)
-    );
-
-    -- Payments table
+    -- Payments table (simplified)
     CREATE TABLE IF NOT EXISTS payments (
         id SERIAL PRIMARY KEY,
-        member_id INTEGER REFERENCES members(id),
-        subscription_id VARCHAR(50),
-        transaction_id VARCHAR(50) UNIQUE NOT NULL,
+        member_id INTEGER REFERENCES members(id) ON DELETE CASCADE,
         amount DECIMAL(10, 2),
-        currency VARCHAR(3),
         payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        status VARCHAR(20)
+        donation_id VARCHAR(100),
+        notes TEXT
+    );
+
+    -- Activity log for debugging
+    CREATE TABLE IF NOT EXISTS webhook_logs (
+        id SERIAL PRIMARY KEY,
+        received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        event_type VARCHAR(50),
+        email VARCHAR(255),
+        payload JSONB,
+        processed BOOLEAN DEFAULT true
     );
 
     -- Indexes for performance
-    CREATE INDEX IF NOT EXISTS idx_subscription_status ON members(subscription_status);
-    CREATE INDEX IF NOT EXISTS idx_referred_by ON members(referred_by);
-    CREATE INDEX IF NOT EXISTS idx_member_payments ON payments(member_id);
-    CREATE INDEX IF NOT EXISTS idx_subscription_payments ON payments(subscription_id);
+    CREATE INDEX IF NOT EXISTS idx_members_email ON members(email);
+    CREATE INDEX IF NOT EXISTS idx_members_status ON members(status);
+    CREATE INDEX IF NOT EXISTS idx_members_subscription_id ON members(subscription_id);
+    CREATE INDEX IF NOT EXISTS idx_payments_member_id ON payments(member_id);
+    CREATE INDEX IF NOT EXISTS idx_webhook_logs_email ON webhook_logs(email);
     `
     
     _, err := db.Exec(schema)
@@ -184,305 +156,208 @@ func (db *Database) createTables() error {
         return fmt.Errorf("failed to create tables: %w", err)
     }
     
-    logger.Println("Database tables created/verified successfully")
+    logger.Println("Database tables verified/created successfully")
     return nil
 }
 
-// Find or create member based on subscription activation
-func (db *Database) handleSubscriptionActivated(event WebhookEvent) error {
-    email := strings.ToLower(event.Resource.Subscriber.EmailAddress)
-    subscriptionID := event.Resource.ID
-    payerID := event.Resource.Subscriber.PayerID
+// Process webhook based on event type
+func (db *Database) processWebhook(webhook MemberWebhook) error {
+    // Log the webhook for debugging
+    payloadJSON, _ := json.Marshal(webhook)
+    _, err := db.Exec(`
+        INSERT INTO webhook_logs (event_type, email, payload)
+        VALUES ($1, $2, $3)
+    `, webhook.EventType, webhook.Email, payloadJSON)
     
-    // Extract referrer from custom_id if present
-    var referrer string
-    if event.Resource.CustomID != "" {
-        // Assuming format like "referrer:email@example.com"
-        parts := strings.SplitN(event.Resource.CustomID, ":", 2)
-        if len(parts) == 2 && parts[0] == "referrer" {
-            referrer = parts[1]
-        }
+    if err != nil {
+        logger.Printf("Warning: Failed to log webhook: %v", err)
     }
     
-    // Parse amount - default to 10 if not specified
-    amount := "10.00"
-    if event.Resource.Amount.Value != "" {
-        amount = event.Resource.Amount.Value
+    // Process based on event type
+    switch webhook.EventType {
+    case "new_subscription", "new_recurring":
+        return db.handleNewSubscription(webhook)
+    case "cancelled", "subscription_cancelled":
+        return db.handleCancellation(webhook)
+    case "payment", "payment_received":
+        return db.handlePayment(webhook)
+    case "failed", "payment_failed":
+        return db.handleFailedPayment(webhook)
+    default:
+        logger.Printf("Unknown event type: %s", webhook.EventType)
+        return nil
     }
+}
+
+// Handle new subscription
+func (db *Database) handleNewSubscription(webhook MemberWebhook) error {
+    email := strings.ToLower(strings.TrimSpace(webhook.Email))
     
-    // Try to find existing member by email or payer_id
+    logger.Printf("Processing new subscription for %s", email)
+    
+    // Check if member exists
     var memberID int
-    var exists bool
-    
     err := db.QueryRow(`
-        SELECT id FROM members 
-        WHERE paypal_email = $1 OR 
-              (paypal_payer_id = $2 AND $2 != '' AND $2 IS NOT NULL)
-        LIMIT 1
-    `, email, payerID).Scan(&memberID)
+        SELECT id FROM members WHERE email = $1
+    `, email).Scan(&memberID)
     
-    exists = err == nil
-    
-    if exists {
+    if err == sql.ErrNoRows {
+        // Create new member
+        err = db.QueryRow(`
+            INSERT INTO members (
+                email, name, subscription_id, status, 
+                monthly_amount, frequency, campaign, phone,
+                joined_date, last_payment_date
+            ) VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, CURRENT_DATE, CURRENT_DATE)
+            RETURNING id
+        `, email, webhook.Name, webhook.DonationID, 
+           webhook.Amount, webhook.Frequency, webhook.Campaign, webhook.Phone).Scan(&memberID)
+        
+        if err != nil {
+            return fmt.Errorf("failed to create member: %w", err)
+        }
+        
+        logger.Printf("Created new member: %s (ID: %d)", email, memberID)
+        
+    } else if err == nil {
         // Update existing member
-        logger.Printf("Updating existing member: %s", email)
-        
-        updateQuery := `
+        _, err = db.Exec(`
             UPDATE members SET
-                current_subscription_id = $1,
-                subscription_status = 'active',
-                monthly_amount = $2,
-                paypal_payer_id = COALESCE(NULLIF($3, ''), paypal_payer_id),
-                given_name = COALESCE(NULLIF($4, ''), given_name),
-                surname = COALESCE(NULLIF($5, ''), surname),
+                name = COALESCE(NULLIF($1, ''), name),
+                subscription_id = COALESCE(NULLIF($2, ''), subscription_id),
+                status = 'active',
+                monthly_amount = $3,
+                frequency = COALESCE(NULLIF($4, ''), frequency),
+                campaign = COALESCE(NULLIF($5, ''), campaign),
+                phone = COALESCE(NULLIF($6, ''), phone),
+                cancelled_date = NULL,
+                last_payment_date = CURRENT_DATE,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = $6
-        `
-        
-        _, err = db.Exec(updateQuery,
-            subscriptionID,
-            amount,
-            payerID,
-            event.Resource.Subscriber.Name.GivenName,
-            event.Resource.Subscriber.Name.Surname,
-            memberID,
-        )
+            WHERE id = $7
+        `, webhook.Name, webhook.DonationID, webhook.Amount, 
+           webhook.Frequency, webhook.Campaign, webhook.Phone, memberID)
         
         if err != nil {
             return fmt.Errorf("failed to update member: %w", err)
         }
         
+        logger.Printf("Reactivated existing member: %s (ID: %d)", email, memberID)
     } else {
-        // Create new member
-        logger.Printf("Creating new member: %s", email)
-        
-        insertQuery := `
-            INSERT INTO members (
-                paypal_email,
-                paypal_payer_id,
-                current_subscription_id,
-                subscription_status,
-                monthly_amount,
-                referred_by,
-                given_name,
-                surname
-            ) VALUES ($1, $2, $3, 'active', $4, $5, $6, $7)
-            RETURNING id
-        `
-        
-        err = db.QueryRow(insertQuery,
-            email,
-            payerID,
-            subscriptionID,
-            amount,
-            referrer,
-            event.Resource.Subscriber.Name.GivenName,
-            event.Resource.Subscriber.Name.Surname,
-        ).Scan(&memberID)
-        
-        if err != nil {
-            return fmt.Errorf("failed to create member: %w", err)
-        }
-    }
-    
-    // Record in subscription history
-    _, err = db.Exec(`
-        INSERT INTO subscription_history (member_id, subscription_id, status)
-        VALUES ($1, $2, 'active')
-        ON CONFLICT (subscription_id) DO UPDATE 
-        SET status = 'active', ended_at = NULL
-    `, memberID, subscriptionID)
-    
-    if err != nil {
-        logger.Printf("Warning: Failed to record subscription history: %v", err)
-    }
-    
-    logger.Printf("Successfully processed subscription activation for %s (member_id: %d)", email, memberID)
-    return nil
-}
-
-// Update member status when subscription is cancelled
-func (db *Database) handleSubscriptionCancelled(event WebhookEvent) error {
-    subscriptionID := event.Resource.ID
-    
-    result, err := db.Exec(`
-        UPDATE members 
-        SET subscription_status = 'cancelled', 
-            updated_at = CURRENT_TIMESTAMP
-        WHERE current_subscription_id = $1
-    `, subscriptionID)
-    
-    if err != nil {
-        return fmt.Errorf("failed to update cancelled subscription: %w", err)
-    }
-    
-    rows, _ := result.RowsAffected()
-    if rows == 0 {
-        logger.Printf("Warning: Subscription %s not found in database", subscriptionID)
-        return nil
-    }
-    
-    // Update subscription history
-    _, err = db.Exec(`
-        UPDATE subscription_history 
-        SET status = 'cancelled', ended_at = CURRENT_TIMESTAMP
-        WHERE subscription_id = $1
-    `, subscriptionID)
-    
-    logger.Printf("Subscription %s marked as cancelled", subscriptionID)
-    return nil
-}
-
-// Update member status when subscription is suspended
-func (db *Database) handleSubscriptionSuspended(event WebhookEvent) error {
-    subscriptionID := event.Resource.ID
-    
-    result, err := db.Exec(`
-        UPDATE members 
-        SET subscription_status = 'suspended', 
-            updated_at = CURRENT_TIMESTAMP
-        WHERE current_subscription_id = $1
-    `, subscriptionID)
-    
-    if err != nil {
-        return fmt.Errorf("failed to update suspended subscription: %w", err)
-    }
-    
-    rows, _ := result.RowsAffected()
-    if rows == 0 {
-        logger.Printf("Warning: Subscription %s not found in database", subscriptionID)
-        return nil
-    }
-    
-    // Update subscription history
-    _, err = db.Exec(`
-        UPDATE subscription_history 
-        SET status = 'suspended'
-        WHERE subscription_id = $1
-    `, subscriptionID)
-    
-    logger.Printf("Subscription %s marked as suspended", subscriptionID)
-    return nil
-}
-
-// Update member status when subscription is reactivated
-func (db *Database) handleSubscriptionReactivated(event WebhookEvent) error {
-    subscriptionID := event.Resource.ID
-    
-    result, err := db.Exec(`
-        UPDATE members 
-        SET subscription_status = 'active', 
-            updated_at = CURRENT_TIMESTAMP
-        WHERE current_subscription_id = $1
-    `, subscriptionID)
-    
-    if err != nil {
-        return fmt.Errorf("failed to reactivate subscription: %w", err)
-    }
-    
-    rows, _ := result.RowsAffected()
-    if rows == 0 {
-        logger.Printf("Warning: Subscription %s not found in database", subscriptionID)
-        return nil
-    }
-    
-    // Update subscription history
-    _, err = db.Exec(`
-        UPDATE subscription_history 
-        SET status = 'active', ended_at = NULL
-        WHERE subscription_id = $1
-    `, subscriptionID)
-    
-    logger.Printf("Subscription %s reactivated", subscriptionID)
-    return nil
-}
-
-// Record payment and update payer_id if missing
-func (db *Database) handlePaymentCompleted(event WebhookEvent) error {
-    // Get payer information from various possible locations in the webhook
-    var payerID, email string
-    
-    if event.Resource.Payer.PayerID != "" {
-        payerID = event.Resource.Payer.PayerID
-        email = event.Resource.Payer.EmailAddress
-    } else if event.Resource.Payer.PayerInfo.PayerID != "" {
-        payerID = event.Resource.Payer.PayerInfo.PayerID
-        email = event.Resource.Payer.PayerInfo.Email
-    }
-    
-    subscriptionID := event.Resource.BillingAgreementID
-    if subscriptionID == "" {
-        // Try to find subscription by payer email
-        if email != "" {
-            err := db.QueryRow(`
-                SELECT current_subscription_id FROM members 
-                WHERE paypal_email = $1
-            `, strings.ToLower(email)).Scan(&subscriptionID)
-            
-            if err != nil {
-                logger.Printf("Warning: Could not find subscription for payment from %s", email)
-            }
-        }
-    }
-    
-    // Update member with payer_id if we don't have it
-    if payerID != "" && subscriptionID != "" {
-        _, err := db.Exec(`
-            UPDATE members 
-            SET paypal_payer_id = COALESCE(paypal_payer_id, $1),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE current_subscription_id = $2 AND 
-                  (paypal_payer_id IS NULL OR paypal_payer_id = '')
-        `, payerID, subscriptionID)
-        
-        if err != nil {
-            logger.Printf("Warning: Failed to update payer_id: %v", err)
-        }
-    }
-    
-    // Get member_id
-    var memberID int
-    err := db.QueryRow(`
-        SELECT id FROM members 
-        WHERE current_subscription_id = $1 OR paypal_payer_id = $2
-        LIMIT 1
-    `, subscriptionID, payerID).Scan(&memberID)
-    
-    if err != nil {
-        logger.Printf("Warning: Could not find member for payment (subscription: %s, payer: %s)", 
-            subscriptionID, payerID)
-        return nil
+        return fmt.Errorf("database error: %w", err)
     }
     
     // Record the payment
     _, err = db.Exec(`
-        INSERT INTO payments (
-            member_id,
-            subscription_id,
-            transaction_id,
-            amount,
-            currency,
-            status
-        ) VALUES ($1, $2, $3, $4, $5, 'completed')
-        ON CONFLICT (transaction_id) DO NOTHING
-    `, memberID, subscriptionID, event.Resource.ID, 
-       event.Resource.Amount.Value, event.Resource.Amount.CurrencyCode)
+        INSERT INTO payments (member_id, amount, donation_id, notes)
+        VALUES ($1, $2, $3, 'Initial subscription payment')
+    `, memberID, webhook.Amount, webhook.DonationID)
+    
+    if err != nil {
+        logger.Printf("Warning: Failed to record payment: %v", err)
+    }
+    
+    // Update total donated
+    _, err = db.Exec(`
+        UPDATE members 
+        SET total_donated = total_donated + $1
+        WHERE id = $2
+    `, webhook.Amount, memberID)
+    
+    return nil
+}
+
+// Handle subscription cancellation
+func (db *Database) handleCancellation(webhook MemberWebhook) error {
+    email := strings.ToLower(strings.TrimSpace(webhook.Email))
+    
+    logger.Printf("Processing cancellation for %s", email)
+    
+    result, err := db.Exec(`
+        UPDATE members SET
+            status = 'cancelled',
+            cancelled_date = CURRENT_DATE,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE email = $1 OR subscription_id = $2
+    `, email, webhook.DonationID)
+    
+    if err != nil {
+        return fmt.Errorf("failed to cancel subscription: %w", err)
+    }
+    
+    rows, _ := result.RowsAffected()
+    if rows == 0 {
+        logger.Printf("Warning: No member found for cancellation: %s", email)
+    } else {
+        logger.Printf("Cancelled subscription for %s", email)
+    }
+    
+    return nil
+}
+
+// Handle successful payment
+func (db *Database) handlePayment(webhook MemberWebhook) error {
+    email := strings.ToLower(strings.TrimSpace(webhook.Email))
+    
+    logger.Printf("Processing payment from %s: $%.2f", email, webhook.Amount)
+    
+    // Get member ID
+    var memberID int
+    err := db.QueryRow(`
+        SELECT id FROM members 
+        WHERE email = $1 OR subscription_id = $2
+    `, email, webhook.DonationID).Scan(&memberID)
+    
+    if err != nil {
+        logger.Printf("Warning: Member not found for payment: %s", email)
+        return nil
+    }
+    
+    // Record payment
+    _, err = db.Exec(`
+        INSERT INTO payments (member_id, amount, donation_id, notes)
+        VALUES ($1, $2, $3, 'Recurring payment')
+    `, memberID, webhook.Amount, webhook.DonationID)
     
     if err != nil {
         return fmt.Errorf("failed to record payment: %w", err)
     }
     
-    logger.Printf("Payment recorded: %s %s for member_id %d", 
-        event.Resource.Amount.Value, event.Resource.Amount.CurrencyCode, memberID)
-    return nil
+    // Update member
+    _, err = db.Exec(`
+        UPDATE members SET
+            last_payment_date = CURRENT_DATE,
+            total_donated = total_donated + $1,
+            status = 'active',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+    `, webhook.Amount, memberID)
+    
+    return err
 }
 
-// Health check handler
+// Handle failed payment
+func (db *Database) handleFailedPayment(webhook MemberWebhook) error {
+    email := strings.ToLower(strings.TrimSpace(webhook.Email))
+    
+    logger.Printf("Processing failed payment for %s", email)
+    
+    _, err := db.Exec(`
+        UPDATE members SET
+            status = 'payment_failed',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE email = $1 OR subscription_id = $2
+    `, email, webhook.DonationID)
+    
+    return err
+}
+
+// HTTP Handlers
+
+// Health check endpoint
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-    // Check database connection
     dbStatus := "ok"
     if err := db.Ping(); err != nil {
-        dbStatus = "error: " + err.Error()
+        dbStatus = fmt.Sprintf("error: %v", err)
     }
     
     response := map[string]interface{}{
@@ -495,48 +370,49 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
     json.NewEncoder(w).Encode(response)
 }
 
-// Stats handler - useful for monitoring
+// Stats endpoint
 func statsHandler(w http.ResponseWriter, r *http.Request) {
     var stats struct {
-        ActiveMembers   int     `json:"active_members"`
         TotalMembers    int     `json:"total_members"`
+        ActiveMembers   int     `json:"active_members"`
         MonthlyRevenue  float64 `json:"monthly_revenue"`
-        SuspendedCount  int     `json:"suspended_count"`
+        TotalDonated    float64 `json:"total_donated"`
+        ChurnedThisMonth int    `json:"churned_this_month"`
     }
     
-    // Get active members count
-    db.QueryRow(`
-        SELECT COUNT(*) FROM members 
-        WHERE subscription_status = 'active'
-    `).Scan(&stats.ActiveMembers)
-    
-    // Get total members
+    // Get stats from database
     db.QueryRow(`SELECT COUNT(*) FROM members`).Scan(&stats.TotalMembers)
-    
-    // Get monthly revenue
-    db.QueryRow(`
-        SELECT COALESCE(SUM(monthly_amount), 0) FROM members 
-        WHERE subscription_status = 'active'
-    `).Scan(&stats.MonthlyRevenue)
-    
-    // Get suspended count
+    db.QueryRow(`SELECT COUNT(*) FROM members WHERE status = 'active'`).Scan(&stats.ActiveMembers)
+    db.QueryRow(`SELECT COALESCE(SUM(monthly_amount), 0) FROM members WHERE status = 'active'`).Scan(&stats.MonthlyRevenue)
+    db.QueryRow(`SELECT COALESCE(SUM(total_donated), 0) FROM members`).Scan(&stats.TotalDonated)
     db.QueryRow(`
         SELECT COUNT(*) FROM members 
-        WHERE subscription_status = 'suspended'
-    `).Scan(&stats.SuspendedCount)
+        WHERE cancelled_date >= date_trunc('month', CURRENT_DATE)
+    `).Scan(&stats.ChurnedThisMonth)
     
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(stats)
 }
 
-// PayPal webhook handler
+// Webhook handler
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
+    // Verify method
     if r.Method != http.MethodPost {
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
         return
     }
     
-    // Read the raw body
+    // Verify authentication
+    authHeader := r.Header.Get("Authorization")
+    expectedAuth := "Bearer " + config.WebhookSecret
+    
+    if authHeader != expectedAuth {
+        logger.Printf("Unauthorized webhook attempt from %s", r.RemoteAddr)
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
+    
+    // Read body
     body, err := io.ReadAll(r.Body)
     if err != nil {
         logger.Printf("Error reading body: %v", err)
@@ -545,162 +421,68 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
     }
     defer r.Body.Close()
     
-    // Parse the webhook event
-    var event WebhookEvent
-    if err := json.Unmarshal(body, &event); err != nil {
+    // Parse webhook
+    var webhook MemberWebhook
+    if err := json.Unmarshal(body, &webhook); err != nil {
         logger.Printf("Error parsing JSON: %v", err)
+        logger.Printf("Raw body: %s", string(body))
         http.Error(w, "Invalid JSON", http.StatusBadRequest)
         return
     }
     
-    // Log the incoming webhook
-    logger.Printf("Received webhook: %s (ID: %s)", event.EventType, event.ID)
+    // Log received webhook
+    logger.Printf("Webhook received - Type: %s, Email: %s, Amount: %.2f", 
+        webhook.EventType, webhook.Email, webhook.Amount)
     
-    // Get PayPal headers for verification
-    headers := map[string]string{
-        "paypal-auth-algo":        r.Header.Get("Paypal-Auth-Algo"),
-        "paypal-cert-url":         r.Header.Get("Paypal-Cert-Url"),
-        "paypal-transmission-id":  r.Header.Get("Paypal-Transmission-Id"),
-        "paypal-transmission-sig": r.Header.Get("Paypal-Transmission-Sig"),
-        "paypal-transmission-time": r.Header.Get("Paypal-Transmission-Time"),
-    }
-    
-    // Verify webhook signature (if webhook ID is configured)
-    if config.PayPalWebhookID != "" {
-        if valid := verifyWebhookSignature(headers, body); !valid {
-            logger.Println("Warning: Invalid webhook signature")
-            // In production, you should return 401
-            // http.Error(w, "Unauthorized", http.StatusUnauthorized)
-            // return
-        }
-    }
-    
-    // Process the webhook event
-    if err := processWebhookEvent(event); err != nil {
+    // Process webhook
+    if err := db.processWebhook(webhook); err != nil {
         logger.Printf("Error processing webhook: %v", err)
-        // Still return 200 to prevent PayPal from retrying
+        // Still return 200 to prevent retries
     }
     
-    // Always return 200 OK to PayPal
     w.WriteHeader(http.StatusOK)
     fmt.Fprint(w, "OK")
 }
 
-// Process different webhook events
-func processWebhookEvent(event WebhookEvent) error {
-    switch event.EventType {
-    case "BILLING.SUBSCRIPTION.ACTIVATED":
-        return db.handleSubscriptionActivated(event)
+// List members endpoint (useful for debugging)
+func listMembersHandler(w http.ResponseWriter, r *http.Request) {
+    // Optional: Add authentication here too
+    
+    rows, err := db.Query(`
+        SELECT email, name, status, monthly_amount, joined_date, total_donated
+        FROM members
+        ORDER BY created_at DESC
+        LIMIT 100
+    `)
+    if err != nil {
+        http.Error(w, "Database error", http.StatusInternalServerError)
+        return
+    }
+    defer rows.Close()
+    
+    var members []map[string]interface{}
+    for rows.Next() {
+        var email, name, status sql.NullString
+        var amount, total sql.NullFloat64
+        var joined sql.NullTime
         
-    case "BILLING.SUBSCRIPTION.CANCELLED":
-        return db.handleSubscriptionCancelled(event)
+        rows.Scan(&email, &name, &status, &amount, &joined, &total)
         
-    case "BILLING.SUBSCRIPTION.SUSPENDED":
-        return db.handleSubscriptionSuspended(event)
-        
-    case "BILLING.SUBSCRIPTION.RE-ACTIVATED":
-        return db.handleSubscriptionReactivated(event)
-        
-    case "PAYMENT.SALE.COMPLETED":
-        return db.handlePaymentCompleted(event)
-        
-    default:
-        logger.Printf("Unhandled event type: %s", event.EventType)
+        members = append(members, map[string]interface{}{
+            "email":         email.String,
+            "name":          name.String,
+            "status":        status.String,
+            "monthly_amount": amount.Float64,
+            "joined_date":   joined.Time,
+            "total_donated": total.Float64,
+        })
     }
     
-    return nil
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(members)
 }
 
-// Verify webhook signature with PayPal
-func verifyWebhookSignature(headers map[string]string, body []byte) bool {
-    // Get access token
-    token, err := getPayPalAccessToken()
-    if err != nil {
-        logger.Printf("Error getting access token: %v", err)
-        return false
-    }
-    
-    // Prepare verification request
-    verificationData := map[string]interface{}{
-        "auth_algo":         headers["paypal-auth-algo"],
-        "cert_url":          headers["paypal-cert-url"],
-        "transmission_id":   headers["paypal-transmission-id"],
-        "transmission_sig":  headers["paypal-transmission-sig"],
-        "transmission_time": headers["paypal-transmission-time"],
-        "webhook_id":        config.PayPalWebhookID,
-        "webhook_event":     json.RawMessage(body),
-    }
-    
-    jsonData, err := json.Marshal(verificationData)
-    if err != nil {
-        logger.Printf("Error marshaling verification data: %v", err)
-        return false
-    }
-    
-    // Send verification request
-    req, err := http.NewRequest("POST", 
-        config.PayPalBaseURL+"/v1/notifications/verify-webhook-signature",
-        bytes.NewBuffer(jsonData))
-    if err != nil {
-        logger.Printf("Error creating verification request: %v", err)
-        return false
-    }
-    
-    req.Header.Set("Authorization", "Bearer "+token)
-    req.Header.Set("Content-Type", "application/json")
-    
-    client := &http.Client{Timeout: 10 * time.Second}
-    resp, err := client.Do(req)
-    if err != nil {
-        logger.Printf("Error sending verification request: %v", err)
-        return false
-    }
-    defer resp.Body.Close()
-    
-    var result struct {
-        VerificationStatus string `json:"verification_status"`
-    }
-    
-    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-        logger.Printf("Error decoding verification response: %v", err)
-        return false
-    }
-    
-    return result.VerificationStatus == "SUCCESS"
-}
-
-// Get PayPal access token
-func getPayPalAccessToken() (string, error) {
-    data := "grant_type=client_credentials"
-    req, err := http.NewRequest("POST",
-        config.PayPalBaseURL+"/v1/oauth2/token",
-        bytes.NewBufferString(data))
-    if err != nil {
-        return "", err
-    }
-    
-    req.SetBasicAuth(config.PayPalClientID, config.PayPalClientSecret)
-    req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-    
-    client := &http.Client{Timeout: 10 * time.Second}
-    resp, err := client.Do(req)
-    if err != nil {
-        return "", err
-    }
-    defer resp.Body.Close()
-    
-    var result struct {
-        AccessToken string `json:"access_token"`
-    }
-    
-    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-        return "", err
-    }
-    
-    return result.AccessToken, nil
-}
-
-// Middleware for logging requests
+// Logging middleware
 func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
     return func(w http.ResponseWriter, r *http.Request) {
         start := time.Now()
@@ -719,7 +501,7 @@ func main() {
     }
     defer db.Close()
     
-    // Create tables if they don't exist
+    // Create tables
     if err := db.createTables(); err != nil {
         logger.Fatalf("Failed to create tables: %v", err)
     }
@@ -727,15 +509,16 @@ func main() {
     // Set up routes
     http.HandleFunc("/health", loggingMiddleware(healthHandler))
     http.HandleFunc("/stats", loggingMiddleware(statsHandler))
-    http.HandleFunc("/api/paypal/webhook", loggingMiddleware(webhookHandler))
+    http.HandleFunc("/webhook", loggingMiddleware(webhookHandler))
+    http.HandleFunc("/members", loggingMiddleware(listMembersHandler))
     
     // Start server
     addr := "127.0.0.1:" + config.Port
-    logger.Printf("Starting webhook server on %s", addr)
-    logger.Printf("Database connected successfully")
-    logger.Printf("PayPal Base URL: %s", config.PayPalBaseURL)
+    logger.Printf("Starting membership server on %s", addr)
+    logger.Printf("Webhook endpoint: https://memberships.operatorfoundation.org/webhook")
+    logger.Printf("Stats endpoint: https://memberships.operatorfoundation.org/stats")
     
     if err := http.ListenAndServe(addr, nil); err != nil {
-        logger.Fatalf("Server failed to start: %v", err)
+        logger.Fatalf("Server failed: %v", err)
     }
 }
