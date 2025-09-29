@@ -17,23 +17,17 @@ import (
 
 // Configuration
 type Config struct {
-    DatabaseURL    string
-    Port           string
-    WebhookSecret  string // Shared secret with Zapier for authentication
+    DatabaseURL   string
+    Port          string
+    WebhookSecret string // Shared secret with Zapier for authentication
 }
 
 // Webhook payload from Zapier/GiveLively
 type MemberWebhook struct {
-    Email        string  `json:"email"`
-    Name         string  `json:"name"`
-    Amount       float64 `json:"amount"`
-    Frequency    string  `json:"frequency"`
-    Status       string  `json:"status"`        // active, cancelled, failed
-    DonationID   string  `json:"donation_id"`   // GiveLively's donation/subscription ID
-    DonationDate string  `json:"donation_date"`
-    EventType    string  `json:"event_type"`    // new_subscription, cancelled, payment, etc.
-    Campaign     string  `json:"campaign,omitempty"`
-    Phone        string  `json:"phone,omitempty"`
+    Email     string `json:"email"`
+    Name      string `json:"name"`
+    Status    string `json:"status"`    // active, cancelled, suspended
+    Anonymous bool   `json:"anonymous"` // If true, don't store name
 }
 
 // Database wrapper
@@ -104,51 +98,38 @@ func NewDatabase(connStr string) (*Database, error) {
 // Create tables if they don't exist
 func (db *Database) createTables() error {
     schema := `
-    -- Members table (simplified - no PayPal specific fields)
+    -- Members table (simplified - email is the identifier)
     CREATE TABLE IF NOT EXISTS members (
         id SERIAL PRIMARY KEY,
         email VARCHAR(255) UNIQUE NOT NULL,
         name VARCHAR(255),
-        subscription_id VARCHAR(100) UNIQUE,  -- GiveLively donation ID
-        status VARCHAR(20) NOT NULL DEFAULT 'pending',
-        monthly_amount DECIMAL(10, 2),
-        frequency VARCHAR(20) DEFAULT 'monthly',
-        campaign VARCHAR(255),
-        phone VARCHAR(50),
-        joined_date DATE,
-        cancelled_date DATE,
-        last_payment_date DATE,
-        total_donated DECIMAL(10, 2) DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        is_anonymous BOOLEAN DEFAULT false,
+        status VARCHAR(20) NOT NULL DEFAULT 'active',
+        first_seen DATE DEFAULT CURRENT_DATE,
+        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
-    -- Payments table (simplified)
-    CREATE TABLE IF NOT EXISTS payments (
+    -- Status history for tracking changes
+    CREATE TABLE IF NOT EXISTS status_history (
         id SERIAL PRIMARY KEY,
         member_id INTEGER REFERENCES members(id) ON DELETE CASCADE,
-        amount DECIMAL(10, 2),
-        payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        donation_id VARCHAR(100),
-        notes TEXT
+        status VARCHAR(20) NOT NULL,
+        changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
-    -- Activity log for debugging
+    -- Webhook log for debugging
     CREATE TABLE IF NOT EXISTS webhook_logs (
         id SERIAL PRIMARY KEY,
         received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        event_type VARCHAR(50),
         email VARCHAR(255),
-        payload JSONB,
-        processed BOOLEAN DEFAULT true
+        status VARCHAR(20),
+        payload JSONB
     );
 
     -- Indexes for performance
     CREATE INDEX IF NOT EXISTS idx_members_email ON members(email);
     CREATE INDEX IF NOT EXISTS idx_members_status ON members(status);
-    CREATE INDEX IF NOT EXISTS idx_members_subscription_id ON members(subscription_id);
-    CREATE INDEX IF NOT EXISTS idx_payments_member_id ON payments(member_id);
-    CREATE INDEX IF NOT EXISTS idx_webhook_logs_email ON webhook_logs(email);
+    CREATE INDEX IF NOT EXISTS idx_status_history_member_id ON status_history(member_id);
     `
     
     _, err := db.Exec(schema)
@@ -160,195 +141,98 @@ func (db *Database) createTables() error {
     return nil
 }
 
-// Process webhook based on event type
+// Process incoming webhook
 func (db *Database) processWebhook(webhook MemberWebhook) error {
-    // Log the webhook for debugging
+    // Normalize email
+    email := strings.ToLower(strings.TrimSpace(webhook.Email))
+    
+    // Validate email
+    if email == "" {
+        return fmt.Errorf("email is required")
+    }
+    
+    // Log the webhook
     payloadJSON, _ := json.Marshal(webhook)
     _, err := db.Exec(`
-        INSERT INTO webhook_logs (event_type, email, payload)
+        INSERT INTO webhook_logs (email, status, payload)
         VALUES ($1, $2, $3)
-    `, webhook.EventType, webhook.Email, payloadJSON)
+    `, email, webhook.Status, payloadJSON)
     
     if err != nil {
         logger.Printf("Warning: Failed to log webhook: %v", err)
     }
     
-    // Process based on event type
-    switch webhook.EventType {
-    case "new_subscription", "new_recurring":
-        return db.handleNewSubscription(webhook)
-    case "cancelled", "subscription_cancelled":
-        return db.handleCancellation(webhook)
-    case "payment", "payment_received":
-        return db.handlePayment(webhook)
-    case "failed", "payment_failed":
-        return db.handleFailedPayment(webhook)
-    default:
-        logger.Printf("Unknown event type: %s", webhook.EventType)
-        return nil
+    // Determine name to store
+    nameToStore := webhook.Name
+    if webhook.Anonymous {
+        nameToStore = "" // Don't store name for anonymous donations
     }
-}
-
-// Handle new subscription
-func (db *Database) handleNewSubscription(webhook MemberWebhook) error {
-    email := strings.ToLower(strings.TrimSpace(webhook.Email))
-    
-    logger.Printf("Processing new subscription for %s", email)
     
     // Check if member exists
     var memberID int
-    err := db.QueryRow(`
-        SELECT id FROM members WHERE email = $1
-    `, email).Scan(&memberID)
+    var currentStatus string
+    err = db.QueryRow(`
+        SELECT id, status FROM members WHERE email = $1
+    `, email).Scan(&memberID, &currentStatus)
     
     if err == sql.ErrNoRows {
         // Create new member
         err = db.QueryRow(`
-            INSERT INTO members (
-                email, name, subscription_id, status, 
-                monthly_amount, frequency, campaign, phone,
-                joined_date, last_payment_date
-            ) VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, CURRENT_DATE, CURRENT_DATE)
+            INSERT INTO members (email, name, is_anonymous, status)
+            VALUES ($1, $2, $3, $4)
             RETURNING id
-        `, email, webhook.Name, webhook.DonationID, 
-           webhook.Amount, webhook.Frequency, webhook.Campaign, webhook.Phone).Scan(&memberID)
+        `, email, nameToStore, webhook.Anonymous, webhook.Status).Scan(&memberID)
         
         if err != nil {
             return fmt.Errorf("failed to create member: %w", err)
         }
         
-        logger.Printf("Created new member: %s (ID: %d)", email, memberID)
+        logger.Printf("Created new member: %s (ID: %d, Status: %s)", email, memberID, webhook.Status)
+        
+        // Record initial status in history
+        _, err = db.Exec(`
+            INSERT INTO status_history (member_id, status)
+            VALUES ($1, $2)
+        `, memberID, webhook.Status)
         
     } else if err == nil {
         // Update existing member
         _, err = db.Exec(`
             UPDATE members SET
-                name = COALESCE(NULLIF($1, ''), name),
-                subscription_id = COALESCE(NULLIF($2, ''), subscription_id),
-                status = 'active',
-                monthly_amount = $3,
-                frequency = COALESCE(NULLIF($4, ''), frequency),
-                campaign = COALESCE(NULLIF($5, ''), campaign),
-                phone = COALESCE(NULLIF($6, ''), phone),
-                cancelled_date = NULL,
-                last_payment_date = CURRENT_DATE,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $7
-        `, webhook.Name, webhook.DonationID, webhook.Amount, 
-           webhook.Frequency, webhook.Campaign, webhook.Phone, memberID)
+                name = CASE 
+                    WHEN $1 = true THEN name  -- Keep existing name if anonymous
+                    WHEN $2 = '' THEN name     -- Keep existing name if new name is empty
+                    ELSE $2                    -- Otherwise update name
+                END,
+                is_anonymous = $1,
+                status = $3,
+                last_updated = CURRENT_TIMESTAMP
+            WHERE id = $4
+        `, webhook.Anonymous, nameToStore, webhook.Status, memberID)
         
         if err != nil {
             return fmt.Errorf("failed to update member: %w", err)
         }
         
-        logger.Printf("Reactivated existing member: %s (ID: %d)", email, memberID)
+        // Record status change if it's different
+        if currentStatus != webhook.Status {
+            _, err = db.Exec(`
+                INSERT INTO status_history (member_id, status)
+                VALUES ($1, $2)
+            `, memberID, webhook.Status)
+            
+            logger.Printf("Updated member %s (ID: %d): %s -> %s", 
+                email, memberID, currentStatus, webhook.Status)
+        } else {
+            logger.Printf("Member %s (ID: %d) status unchanged: %s", 
+                email, memberID, webhook.Status)
+        }
+        
     } else {
         return fmt.Errorf("database error: %w", err)
     }
     
-    // Record the payment
-    _, err = db.Exec(`
-        INSERT INTO payments (member_id, amount, donation_id, notes)
-        VALUES ($1, $2, $3, 'Initial subscription payment')
-    `, memberID, webhook.Amount, webhook.DonationID)
-    
-    if err != nil {
-        logger.Printf("Warning: Failed to record payment: %v", err)
-    }
-    
-    // Update total donated
-    _, err = db.Exec(`
-        UPDATE members 
-        SET total_donated = total_donated + $1
-        WHERE id = $2
-    `, webhook.Amount, memberID)
-    
     return nil
-}
-
-// Handle subscription cancellation
-func (db *Database) handleCancellation(webhook MemberWebhook) error {
-    email := strings.ToLower(strings.TrimSpace(webhook.Email))
-    
-    logger.Printf("Processing cancellation for %s", email)
-    
-    result, err := db.Exec(`
-        UPDATE members SET
-            status = 'cancelled',
-            cancelled_date = CURRENT_DATE,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE email = $1 OR subscription_id = $2
-    `, email, webhook.DonationID)
-    
-    if err != nil {
-        return fmt.Errorf("failed to cancel subscription: %w", err)
-    }
-    
-    rows, _ := result.RowsAffected()
-    if rows == 0 {
-        logger.Printf("Warning: No member found for cancellation: %s", email)
-    } else {
-        logger.Printf("Cancelled subscription for %s", email)
-    }
-    
-    return nil
-}
-
-// Handle successful payment
-func (db *Database) handlePayment(webhook MemberWebhook) error {
-    email := strings.ToLower(strings.TrimSpace(webhook.Email))
-    
-    logger.Printf("Processing payment from %s: $%.2f", email, webhook.Amount)
-    
-    // Get member ID
-    var memberID int
-    err := db.QueryRow(`
-        SELECT id FROM members 
-        WHERE email = $1 OR subscription_id = $2
-    `, email, webhook.DonationID).Scan(&memberID)
-    
-    if err != nil {
-        logger.Printf("Warning: Member not found for payment: %s", email)
-        return nil
-    }
-    
-    // Record payment
-    _, err = db.Exec(`
-        INSERT INTO payments (member_id, amount, donation_id, notes)
-        VALUES ($1, $2, $3, 'Recurring payment')
-    `, memberID, webhook.Amount, webhook.DonationID)
-    
-    if err != nil {
-        return fmt.Errorf("failed to record payment: %w", err)
-    }
-    
-    // Update member
-    _, err = db.Exec(`
-        UPDATE members SET
-            last_payment_date = CURRENT_DATE,
-            total_donated = total_donated + $1,
-            status = 'active',
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = $2
-    `, webhook.Amount, memberID)
-    
-    return err
-}
-
-// Handle failed payment
-func (db *Database) handleFailedPayment(webhook MemberWebhook) error {
-    email := strings.ToLower(strings.TrimSpace(webhook.Email))
-    
-    logger.Printf("Processing failed payment for %s", email)
-    
-    _, err := db.Exec(`
-        UPDATE members SET
-            status = 'payment_failed',
-            updated_at = CURRENT_TIMESTAMP
-        WHERE email = $1 OR subscription_id = $2
-    `, email, webhook.DonationID)
-    
-    return err
 }
 
 // HTTP Handlers
@@ -373,22 +257,17 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 // Stats endpoint
 func statsHandler(w http.ResponseWriter, r *http.Request) {
     var stats struct {
-        TotalMembers    int     `json:"total_members"`
-        ActiveMembers   int     `json:"active_members"`
-        MonthlyRevenue  float64 `json:"monthly_revenue"`
-        TotalDonated    float64 `json:"total_donated"`
-        ChurnedThisMonth int    `json:"churned_this_month"`
+        TotalMembers     int `json:"total_members"`
+        ActiveMembers    int `json:"active_members"`
+        CancelledMembers int `json:"cancelled_members"`
+        AnonymousMembers int `json:"anonymous_members"`
     }
     
     // Get stats from database
     db.QueryRow(`SELECT COUNT(*) FROM members`).Scan(&stats.TotalMembers)
     db.QueryRow(`SELECT COUNT(*) FROM members WHERE status = 'active'`).Scan(&stats.ActiveMembers)
-    db.QueryRow(`SELECT COALESCE(SUM(monthly_amount), 0) FROM members WHERE status = 'active'`).Scan(&stats.MonthlyRevenue)
-    db.QueryRow(`SELECT COALESCE(SUM(total_donated), 0) FROM members`).Scan(&stats.TotalDonated)
-    db.QueryRow(`
-        SELECT COUNT(*) FROM members 
-        WHERE cancelled_date >= date_trunc('month', CURRENT_DATE)
-    `).Scan(&stats.ChurnedThisMonth)
+    db.QueryRow(`SELECT COUNT(*) FROM members WHERE status = 'cancelled'`).Scan(&stats.CancelledMembers)
+    db.QueryRow(`SELECT COUNT(*) FROM members WHERE is_anonymous = true`).Scan(&stats.AnonymousMembers)
     
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(stats)
@@ -431,8 +310,8 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
     }
     
     // Log received webhook
-    logger.Printf("Webhook received - Type: %s, Email: %s, Amount: %.2f", 
-        webhook.EventType, webhook.Email, webhook.Amount)
+    logger.Printf("Webhook received - Email: %s, Status: %s, Anonymous: %v", 
+        webhook.Email, webhook.Status, webhook.Anonymous)
     
     // Process webhook
     if err := db.processWebhook(webhook); err != nil {
@@ -444,16 +323,26 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
     fmt.Fprint(w, "OK")
 }
 
-// List members endpoint (useful for debugging)
+// List members endpoint
 func listMembersHandler(w http.ResponseWriter, r *http.Request) {
-    // Optional: Add authentication here too
+    // Optional: Add authentication here
     
-    rows, err := db.Query(`
-        SELECT email, name, status, monthly_amount, joined_date, total_donated
+    status := r.URL.Query().Get("status") // Allow filtering by status
+    
+    query := `
+        SELECT email, name, is_anonymous, status, first_seen, last_updated
         FROM members
-        ORDER BY created_at DESC
-        LIMIT 100
-    `)
+    `
+    args := []interface{}{}
+    
+    if status != "" {
+        query += " WHERE status = $1"
+        args = append(args, status)
+    }
+    
+    query += " ORDER BY last_updated DESC LIMIT 100"
+    
+    rows, err := db.Query(query, args...)
     if err != nil {
         http.Error(w, "Database error", http.StatusInternalServerError)
         return
@@ -463,23 +352,42 @@ func listMembersHandler(w http.ResponseWriter, r *http.Request) {
     var members []map[string]interface{}
     for rows.Next() {
         var email, name, status sql.NullString
-        var amount, total sql.NullFloat64
-        var joined sql.NullTime
+        var isAnonymous sql.NullBool
+        var firstSeen, lastUpdated sql.NullTime
         
-        rows.Scan(&email, &name, &status, &amount, &joined, &total)
+        rows.Scan(&email, &name, &isAnonymous, &status, &firstSeen, &lastUpdated)
         
-        members = append(members, map[string]interface{}{
-            "email":         email.String,
-            "name":          name.String,
-            "status":        status.String,
-            "monthly_amount": amount.Float64,
-            "joined_date":   joined.Time,
-            "total_donated": total.Float64,
-        })
+        member := map[string]interface{}{
+            "email":        email.String,
+            "status":       status.String,
+            "is_anonymous": isAnonymous.Bool,
+            "first_seen":   firstSeen.Time,
+            "last_updated": lastUpdated.Time,
+        }
+        
+        // Only include name if not anonymous
+        if !isAnonymous.Bool && name.Valid {
+            member["name"] = name.String
+        }
+        
+        members = append(members, member)
     }
     
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(members)
+}
+
+// Test webhook endpoint for debugging
+func testWebhookHandler(w http.ResponseWriter, r *http.Request) {
+    testData := MemberWebhook{
+        Email:     "test@example.com",
+        Name:      "Test User",
+        Status:    "active",
+        Anonymous: false,
+    }
+    
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(testData)
 }
 
 // Logging middleware
@@ -511,12 +419,14 @@ func main() {
     http.HandleFunc("/stats", loggingMiddleware(statsHandler))
     http.HandleFunc("/webhook", loggingMiddleware(webhookHandler))
     http.HandleFunc("/members", loggingMiddleware(listMembersHandler))
+    http.HandleFunc("/test", loggingMiddleware(testWebhookHandler))
     
     // Start server
     addr := "127.0.0.1:" + config.Port
     logger.Printf("Starting membership server on %s", addr)
     logger.Printf("Webhook endpoint: https://memberships.operatorfoundation.org/webhook")
     logger.Printf("Stats endpoint: https://memberships.operatorfoundation.org/stats")
+    logger.Printf("Members endpoint: https://memberships.operatorfoundation.org/members")
     
     if err := http.ListenAndServe(addr, nil); err != nil {
         logger.Fatalf("Server failed: %v", err)
