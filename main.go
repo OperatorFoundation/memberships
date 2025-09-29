@@ -2,6 +2,7 @@ package main
 
 import (
     "database/sql"
+    "encoding/base64"
     "encoding/json"
     "fmt"
     "io"
@@ -19,15 +20,15 @@ import (
 type Config struct {
     DatabaseURL   string
     Port          string
-    WebhookSecret string // Shared secret with Zapier for authentication
+    WebhookSecret string
 }
 
-// Webhook payload from Zapier/GiveLively
+// Webhook payload from Zapier - accepts strings since that's what Zapier sends
 type MemberWebhook struct {
     Email     string `json:"email"`
     Name      string `json:"name"`
-    Status    string `json:"status"`    // active, cancelled, suspended
-    Anonymous bool   `json:"anonymous"` // If true, don't store name
+    Status    string `json:"status"`    // Zapier sends "Succeeded", "Failed", etc.
+    Anonymous string `json:"anonymous"` // Zapier sends "True", "False" as strings
 }
 
 // Database wrapper
@@ -95,52 +96,6 @@ func NewDatabase(connStr string) (*Database, error) {
     return &Database{conn}, nil
 }
 
-// Create tables if they don't exist
-func (db *Database) createTables() error {
-    schema := `
-    -- Members table (simplified - email is the identifier)
-    CREATE TABLE IF NOT EXISTS members (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) UNIQUE NOT NULL,
-        name VARCHAR(255),
-        is_anonymous BOOLEAN DEFAULT false,
-        status VARCHAR(20) NOT NULL DEFAULT 'active',
-        first_seen DATE DEFAULT CURRENT_DATE,
-        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    -- Status history for tracking changes
-    CREATE TABLE IF NOT EXISTS status_history (
-        id SERIAL PRIMARY KEY,
-        member_id INTEGER REFERENCES members(id) ON DELETE CASCADE,
-        status VARCHAR(20) NOT NULL,
-        changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    -- Webhook log for debugging
-    CREATE TABLE IF NOT EXISTS webhook_logs (
-        id SERIAL PRIMARY KEY,
-        received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        email VARCHAR(255),
-        status VARCHAR(20),
-        payload JSONB
-    );
-
-    -- Indexes for performance
-    CREATE INDEX IF NOT EXISTS idx_members_email ON members(email);
-    CREATE INDEX IF NOT EXISTS idx_members_status ON members(status);
-    CREATE INDEX IF NOT EXISTS idx_status_history_member_id ON status_history(member_id);
-    `
-    
-    _, err := db.Exec(schema)
-    if err != nil {
-        return fmt.Errorf("failed to create tables: %w", err)
-    }
-    
-    logger.Println("Database tables verified/created successfully")
-    return nil
-}
-
 // Process incoming webhook
 func (db *Database) processWebhook(webhook MemberWebhook) error {
     // Normalize email
@@ -151,21 +106,42 @@ func (db *Database) processWebhook(webhook MemberWebhook) error {
         return fmt.Errorf("email is required")
     }
     
+    // Convert Zapier's payment status to our membership status
+    memberStatus := "active" // default
+    statusLower := strings.ToLower(webhook.Status)
+    
+    if strings.Contains(statusLower, "succeed") || strings.Contains(statusLower, "success") || strings.Contains(statusLower, "active") {
+        memberStatus = "active"
+    } else if strings.Contains(statusLower, "fail") || strings.Contains(statusLower, "cancel") || strings.Contains(statusLower, "refund") {
+        memberStatus = "cancelled"
+    } else if strings.Contains(statusLower, "suspend") || strings.Contains(statusLower, "pend") {
+        memberStatus = "suspended"
+    } else {
+        logger.Printf("Unexpected status '%s' for %s, defaulting to 'active'", webhook.Status, email)
+    }
+    
+    // Convert anonymous string to boolean
+    isAnonymous := false
+    anonLower := strings.ToLower(strings.TrimSpace(webhook.Anonymous))
+    if anonLower == "true" || anonLower == "yes" || anonLower == "1" {
+        isAnonymous = true
+    }
+    
+    // Determine name to store
+    nameToStore := webhook.Name
+    if isAnonymous {
+        nameToStore = "" // Don't store name for anonymous donations
+    }
+    
     // Log the webhook
     payloadJSON, _ := json.Marshal(webhook)
     _, err := db.Exec(`
         INSERT INTO webhook_logs (email, status, payload)
         VALUES ($1, $2, $3)
-    `, email, webhook.Status, payloadJSON)
+    `, email, memberStatus, payloadJSON)
     
     if err != nil {
         logger.Printf("Warning: Failed to log webhook: %v", err)
-    }
-    
-    // Determine name to store
-    nameToStore := webhook.Name
-    if webhook.Anonymous {
-        nameToStore = "" // Don't store name for anonymous donations
     }
     
     // Check if member exists
@@ -178,22 +154,22 @@ func (db *Database) processWebhook(webhook MemberWebhook) error {
     if err == sql.ErrNoRows {
         // Create new member
         err = db.QueryRow(`
-            INSERT INTO members (email, name, is_anonymous, status)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO members (email, name, is_anonymous, status, first_seen, last_updated)
+            VALUES ($1, $2, $3, $4, CURRENT_DATE, CURRENT_TIMESTAMP)
             RETURNING id
-        `, email, nameToStore, webhook.Anonymous, webhook.Status).Scan(&memberID)
+        `, email, nameToStore, isAnonymous, memberStatus).Scan(&memberID)
         
         if err != nil {
             return fmt.Errorf("failed to create member: %w", err)
         }
         
-        logger.Printf("Created new member: %s (ID: %d, Status: %s)", email, memberID, webhook.Status)
+        logger.Printf("Created new member: %s (ID: %d, Status: %s)", email, memberID, memberStatus)
         
         // Record initial status in history
         _, err = db.Exec(`
             INSERT INTO status_history (member_id, status)
             VALUES ($1, $2)
-        `, memberID, webhook.Status)
+        `, memberID, memberStatus)
         
     } else if err == nil {
         // Update existing member
@@ -208,24 +184,24 @@ func (db *Database) processWebhook(webhook MemberWebhook) error {
                 status = $3,
                 last_updated = CURRENT_TIMESTAMP
             WHERE id = $4
-        `, webhook.Anonymous, nameToStore, webhook.Status, memberID)
+        `, isAnonymous, nameToStore, memberStatus, memberID)
         
         if err != nil {
             return fmt.Errorf("failed to update member: %w", err)
         }
         
-        // Record status change if it's different
-        if currentStatus != webhook.Status {
+        // Record status change if different
+        if currentStatus != memberStatus {
             _, err = db.Exec(`
                 INSERT INTO status_history (member_id, status)
                 VALUES ($1, $2)
-            `, memberID, webhook.Status)
+            `, memberID, memberStatus)
             
             logger.Printf("Updated member %s (ID: %d): %s -> %s", 
-                email, memberID, currentStatus, webhook.Status)
+                email, memberID, currentStatus, memberStatus)
         } else {
             logger.Printf("Member %s (ID: %d) status unchanged: %s", 
-                email, memberID, webhook.Status)
+                email, memberID, memberStatus)
         }
         
     } else {
@@ -234,8 +210,6 @@ func (db *Database) processWebhook(webhook MemberWebhook) error {
     
     return nil
 }
-
-// HTTP Handlers
 
 // Health check endpoint
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -263,7 +237,6 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
         AnonymousMembers int `json:"anonymous_members"`
     }
     
-    // Get stats from database
     db.QueryRow(`SELECT COUNT(*) FROM members`).Scan(&stats.TotalMembers)
     db.QueryRow(`SELECT COUNT(*) FROM members WHERE status = 'active'`).Scan(&stats.ActiveMembers)
     db.QueryRow(`SELECT COUNT(*) FROM members WHERE status = 'cancelled'`).Scan(&stats.CancelledMembers)
@@ -275,17 +248,35 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 
 // Webhook handler
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
-    // Verify method
     if r.Method != http.MethodPost {
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
         return
     }
     
-    // Verify authentication
+    // Check authorization - support multiple formats
     authHeader := r.Header.Get("Authorization")
-    expectedAuth := "Bearer " + config.WebhookSecret
+    authorized := false
     
-    if authHeader != expectedAuth {
+    // Check Bearer token
+    if authHeader == "Bearer " + config.WebhookSecret {
+        authorized = true
+    }
+    
+    // Check Basic auth (from Zapier)
+    if strings.HasPrefix(authHeader, "Basic ") {
+        payload, _ := base64.StdEncoding.DecodeString(strings.TrimPrefix(authHeader, "Basic "))
+        parts := strings.SplitN(string(payload), ":", 2)
+        if len(parts) == 2 && (parts[1] == config.WebhookSecret || parts[0] == config.WebhookSecret) {
+            authorized = true
+        }
+    }
+    
+    // Check custom header as fallback
+    if !authorized && r.Header.Get("X-Webhook-Secret") == config.WebhookSecret {
+        authorized = true
+    }
+    
+    if !authorized {
         logger.Printf("Unauthorized webhook attempt from %s", r.RemoteAddr)
         http.Error(w, "Unauthorized", http.StatusUnauthorized)
         return
@@ -310,7 +301,7 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
     }
     
     // Log received webhook
-    logger.Printf("Webhook received - Email: %s, Status: %s, Anonymous: %v", 
+    logger.Printf("Webhook received - Email: %s, Status: %s, Anonymous: %s", 
         webhook.Email, webhook.Status, webhook.Anonymous)
     
     // Process webhook
@@ -325,9 +316,7 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 
 // List members endpoint
 func listMembersHandler(w http.ResponseWriter, r *http.Request) {
-    // Optional: Add authentication here
-    
-    status := r.URL.Query().Get("status") // Allow filtering by status
+    status := r.URL.Query().Get("status")
     
     query := `
         SELECT email, name, is_anonymous, status, first_seen, last_updated
@@ -365,7 +354,6 @@ func listMembersHandler(w http.ResponseWriter, r *http.Request) {
             "last_updated": lastUpdated.Time,
         }
         
-        // Only include name if not anonymous
         if !isAnonymous.Bool && name.Valid {
             member["name"] = name.String
         }
@@ -375,19 +363,6 @@ func listMembersHandler(w http.ResponseWriter, r *http.Request) {
     
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(members)
-}
-
-// Test webhook endpoint for debugging
-func testWebhookHandler(w http.ResponseWriter, r *http.Request) {
-    testData := MemberWebhook{
-        Email:     "test@example.com",
-        Name:      "Test User",
-        Status:    "active",
-        Anonymous: false,
-    }
-    
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(testData)
 }
 
 // Logging middleware
@@ -409,17 +384,14 @@ func main() {
     }
     defer db.Close()
     
-    // Create tables
-    if err := db.createTables(); err != nil {
-        logger.Fatalf("Failed to create tables: %v", err)
-    }
+    // Note: Tables should already exist from migrations
+    // If you need to create tables, run migrations first
     
     // Set up routes
     http.HandleFunc("/health", loggingMiddleware(healthHandler))
     http.HandleFunc("/stats", loggingMiddleware(statsHandler))
     http.HandleFunc("/webhook", loggingMiddleware(webhookHandler))
     http.HandleFunc("/members", loggingMiddleware(listMembersHandler))
-    http.HandleFunc("/test", loggingMiddleware(testWebhookHandler))
     
     // Start server
     addr := "127.0.0.1:" + config.Port
